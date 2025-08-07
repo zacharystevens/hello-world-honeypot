@@ -1,4 +1,4 @@
-name: 🤖 AI-Powered Code Review (Fixed)
+name: 🤖 AI-Powered Code Review 
 
 on:
   pull_request:
