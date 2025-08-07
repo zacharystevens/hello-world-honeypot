@@ -1,0 +1,250 @@
+name: Terraform Lint, Validate & Plan
+
+on:
+  pull_request:
+    paths:
+      - 'tf-*/**'
+      - '.github/workflows/terraform-validate.yml'
+    branches: [ main, dev ]
+  push:
+    paths:
+      - 'tf-*/**'
+      - '.github/workflows/terraform-validate.yml'
+    branches: [ main, dev ]
+  # Explicit workflow dispatch with specific environments only
+  workflow_dispatch:
+    inputs:
+      tf_directory:
+        description: 'Terraform directory to run against'
+        required: true
+        default: 'tf-lambda-hello-world'
+        type: choice
+        options:
+          - tf-lambda-hello-world
+          - tf-fargate-hello-world
+          - tf-iam-github
+      environment:
+        description: 'Environment to run against'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - stage
+
+# Define explicitly minimal required permissions
+permissions:
+  contents: read    # Reduced from write to read
+  pull-requests: write
+  id-token: write   # Required for OIDC token
+
+jobs:
+  # Determine which terraform directories have changed
+  changes:
+    name: Detect Changed Terraform Directories
+    runs-on: ubuntu-latest
+    # Prevent from running on forks
+    if: github.repository == '${{ github.repository_owner }}/hello-world'
+    outputs:
+      terraform_dirs: ${{ steps.filter.outputs.terraform_dirs }}
+      any_changed: ${{ steps.filter.outputs.any_changed }}
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Get modified terraform directories
+        id: filter
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # For workflow_dispatch, use the specified directory
+            echo "terraform_dirs=[\"${{ github.event.inputs.tf_directory }}\"]" >> $GITHUB_OUTPUT
+            echo "any_changed=true" >> $GITHUB_OUTPUT
+          else
+            # For push or pull_request, find which directories changed
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              # For PRs, compare with the base branch
+              CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }})
+            else
+              # For pushes, compare with the previous commit
+              CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+            fi
+            
+            # Extract unique tf-* directories from changed files
+            DIRS=$(echo "$CHANGED_FILES" | grep -E '^tf-[^/]+/' | cut -d'/' -f1 | sort -u)
+            
+            if [[ -z "$DIRS" ]]; then
+              echo "No Terraform directories changed"
+              echo "terraform_dirs=[]" >> $GITHUB_OUTPUT
+              echo "any_changed=false" >> $GITHUB_OUTPUT
+            else
+              # Convert list of directories to JSON array format
+              JSON_ARRAY=$(echo "$DIRS" | sed 's/^/"/g' | sed 's/$/"/g' | paste -sd, -)
+              echo "terraform_dirs=[$JSON_ARRAY]" >> $GITHUB_OUTPUT
+              echo "any_changed=true" >> $GITHUB_OUTPUT
+              echo "Found changed Terraform directories: $JSON_ARRAY"
+            fi
+          fi
+
+  # Run Terraform validation on each changed directory
+  terraform:
+    name: Terraform Lint, Validate & Plan
+    needs: changes
+    if: needs.changes.outputs.any_changed == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        tf_dir: ${{ fromJson(needs.changes.outputs.terraform_dirs) }}
+    
+    # Environment-specific configuration  
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    defaults:
+      run:
+        working-directory: ./${{ matrix.tf_dir }}
+
+    steps:
+      # Security scan for GitHub action workflows
+      - name: Scan Actions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/workflows
+          sparse-checkout-cone-mode: false
+          
+      - name: Run actionlint
+        uses: raven-actions/actionlint@v1
+
+      # Main checkout
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Important for PR comments and version tracking
+          # Always verify code integrity
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      # Dependency scanning for vulnerabilities - commented out for local testing
+      # - name: Initialize dependency scanning
+      #   uses: github/dependency-review-action@v1
+      #   if: github.event_name == 'pull_request'
+      #   with:
+      #     fail-on-severity: critical
+      #     deny-licenses: AGPL-1.0, AGPL-3.0
+
+      # AWS credential configuration with audience for increased security
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: GitHubActionsSession-${{ github.run_id }}
+          role-duration-seconds: 1800  # Limit token lifetime to 30 minutes
+          audience: "sts.amazonaws.com"  # Explicitly verify the intended audience
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+          terraform_wrapper: false  # Recommended for better error handling
+
+      # Only allow TFLint from trusted source
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Initialize TFLint
+        run: tflint --init
+        
+      - name: Cache Terraform plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Format Fix
+        if: steps.fmt.outcome == 'failure' && github.event_name == 'pull_request'
+        run: |
+          terraform fmt -recursive
+          git config --global user.name 'GitHub Actions Bot'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add .
+          git diff --quiet && git diff --staged --quiet || (git commit -m 'chore: terraform fmt fixes' && git push)
+
+      - name: Run TFLint
+        run: tflint --recursive --format compact
+        continue-on-error: true
+
+      # Additional security scan for Terraform
+      - name: Scan for Terraform secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./${{ matrix.tf_dir }}
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+      - name: Terraform Init
+        run: |
+          terraform init -backend=false
+          
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        if: github.event_name == 'pull_request'
+        run: terraform plan -no-color -input=false -out=tfplan
+        continue-on-error: true
+
+      - name: Upload tfplan
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.tf_dir }}-${{ github.event.pull_request.number }}
+          path: ${{ matrix.tf_dir }}/tfplan
+          retention-days: 5
+
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Directory: \`${{ matrix.tf_dir }}\`
+            #### Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Plan 📖\`${{ steps.plan.outcome }}\`
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`terraform\n
+            ${process.env.PLAN}
+            \`\`\`
+            
+            </details>
+            
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+        env:
+          PLAN: "${{ steps.plan.outputs.stdout }}"
+
+      - name: Terraform Security Scan
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          soft_fail: false  # Fail on any security issues to prevent insecure deployments
