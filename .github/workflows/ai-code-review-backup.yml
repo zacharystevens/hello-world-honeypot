@@ -226,6 +226,9 @@ jobs:
             *This review was generated automatically by our AI Code Review system. For questions or feedback, please reach out to the DevOps team.*
             `;
             
+            // Persist to workspace to avoid template injection in later steps
+            fs.writeFileSync('ai_review.md', aiReview, 'utf8');
+            
             return aiReview;
 
       - name: 💬 Post AI Review Comment
@@ -233,7 +236,8 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const aiReview = `${{ steps.ai-review.outputs.result }}`;
+            const fs = require('fs');
+            const aiReview = fs.readFileSync('ai_review.md', 'utf8');
             
             // Find existing AI review comment
             const comments = await github.rest.issues.listComments({
