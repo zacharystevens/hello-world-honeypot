@@ -1,3 +1,107 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  scan:
+    name: Run Security Scanners
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare results directory
+        run: mkdir -p security-results
+
+      - name: Secrets scan (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --source . --report-format sarif --report-path security-results/gitleaks.sarif --exit-code 0
+
+      - name: SCA and IaC scan (Trivy)
+        uses: aquasecurity/trivy-action@0.22.0
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'security-results/trivy.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+          exit-code: '0'
+
+      - name: Install Semgrep
+        run: |
+          pipx --version || python3 -m pip install --user pipx
+          pipx install semgrep || python3 -m pip install --user semgrep
+
+      - name: SAST scan (Semgrep)
+        run: |
+          semgrep --version
+          semgrep --config p/ci --timeout 0 --sarif --output security-results/semgrep.sarif || true
+
+      - name: IaC scan (Checkov)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          quiet: true
+          soft_fail: true
+          output_format: sarif
+          output_file_path: security-results/checkov.sarif
+
+      - name: Upload SARIF results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: security-results
+
+  automated-fixes:
+    name: Automated Security Fixes
+    needs: scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pip-audit
+        run: python -m pip install --upgrade pip && pip install pip-audit
+
+      - name: Attempt dependency auto-fix (pip-audit)
+        run: |
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt --fix --strict || true
+          fi
+
+      - name: Create Pull Request with fixes
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore: automated security dependency updates"
+          branch: chore/automated-security-fixes
+          title: "Automated security fixes"
+          body: "This PR updates dependencies based on pip-audit findings."
+          labels: "security, automated pr"
+          signoff: false
 name: 🔒 Enterprise Security Scanning
 
 on:
